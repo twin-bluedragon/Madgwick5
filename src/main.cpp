@@ -8,23 +8,28 @@
 #include <M5Stack.h>
 #include <BMM150class.h>
 #include <utility/quaternionFilters.h>
-//#include <BluetoothSerial.h>
+#include <esp_now.h>
 #include <WiFi.h>
-#include <WiFiUDP.h>
+#include <Preferences.h>  //不揮発メモリを操作するライブラリ 使い方：https://qiita.com/T-YOSH/items/f388b4d7cbc829829aae
 
-//BluetoothSerial SerialBT;
+//#define DEVICENUM 5
+uint8_t state = 0;
+
+uint8_t devvar;
+
+//ESP_NOW
+bool rcvmsg = false;
+bool master_addr_get = false;
+uint8_t master_addr[] = {0,0,0,0,0,0};
+uint8_t rxbuf[250];
+int rxlen=0;
+uint8_t txbuf[250];
+int txlen=0;
+unsigned int txcnt=0;
+esp_now_peer_info_t peerInfo;
 
 //#define MAHONY
 #define MADGWICK
-#define DEVICENUM 0
-
-const char ssid[] = "Buffalo-2088";
-const char pass[] = "r6xvjbtb7ye7k";
-const char *dstddr = "192.168.3.33";
-const int dst_port = 50007;
-const int my_port = 50008;
-
-WiFiUDP wifiUdp;
 
 BMM150class bmm150;
 TaskHandle_t lcdTaskHandle = NULL;
@@ -75,7 +80,7 @@ float deltat = 0.0f;
 float magnetX1, magnetY1, magnetZ1;
 float head_dir;
 
-// Task function
+// マルチタスクで登録されるタスク
 void lcdUpdateTask(void *args)
 {
   while (1) // never ending
@@ -106,28 +111,52 @@ void lcdUpdateTask(void *args)
 
     M5.Lcd.setCursor(0, 198);
     M5.Lcd.printf("Temperature : %.2f C ", temp);
-//    Serial.printf(" %5.2f,  %5.2f,  %5.2f  \r\n", roll, pitch, -yaw); // to processing *yaw polarity reversed
-//    SerialBT.printf(" %5.2f,  %5.2f,  %5.2f  \r\n", roll, pitch, -yaw); // to processing *yaw polarity reversed
-    char txbuf[256]="";
-//    sprintf(txbuf,"%02d,  %5.2f,  %5.2f,  %5.2f,  %5.2f\r\n", DEVICENUM,mq0,mq1,mq2,mq3);
-      sprintf(txbuf,"[{\"dev\":%02d,\"q\":[%5.2f,%5.2f,%5.2f,%5.2f]}]\r\n",DEVICENUM,mq0,mq1,mq2,mq3);
-//    Serial.printf("%02d,  %5.2f,  %5.2f,  %5.2f,  %5.2f\r\n", DEVICENUM,mq0,mq1,mq2,mq3); 
-//    SerialBT.printf("%02d,  %5.2f,  %5.2f,  %5.2f,  %5.2f\r\n", DEVICENUM,mq0,mq1,mq2,mq3); 
-    Serial.printf("%s",txbuf);
-    wifiUdp.beginPacket(dstddr,dst_port);
-    wifiUdp.write((const uint8_t*)txbuf,strlen(txbuf));
-    wifiUdp.endPacket();
+    memset(txbuf,0,250);
+    sprintf((char*)txbuf,"{\"dev\":%d,\"q\":[%5.2f,%5.2f,%5.2f,%5.2f]}",devvar,mq0,mq1,mq2,mq3);
+    txlen=strlen((char*)txbuf);
+    //Serial.printf("%s",txbuf);
 
     M5.Lcd.setCursor(20, 220);
     M5.Lcd.printf("BTN_A:CAL ");
 
     M5.Lcd.setCursor(200,220);
-    M5.Lcd.printf("DEVICE:%02d",DEVICENUM);
+    M5.Lcd.printf("DEVICE:%02d",devvar);
 
     delay(50);
   }
 }
 
+// ESP-NOWで受信した際に呼び出されるコールバック関数
+void onReceive(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
+  rcvmsg = true;
+  memcpy(rxbuf,data,data_len);//受信バッファにデータをコピーする
+  rxlen = data_len;
+  if(*data==0){ //受信データの1バイト目が0だったらマスターアドレス取得フェーズとみなし、そのMACアドレスをmaster_addrとする
+    memcpy(master_addr,mac_addr,6);
+    master_addr_get = true;
+  }
+}
+
+// ESP-NOWで受信した際に呼び出されるコールバック関数（何もしない）
+void onSend(const uint8_t* mac_addr, esp_now_send_status_t status) {
+
+}
+
+//ESP-NOWの初期化で、マスターのアドレスをピアのリストに登録する
+esp_err_t set_master_as_peer(){
+    memcpy(peerInfo.peer_addr, master_addr, 6);
+    peerInfo.channel = 0;
+    peerInfo.encrypt = false;
+
+    esp_err_t errorcode = esp_now_add_peer(&peerInfo);
+    if(errorcode != ESP_OK)
+      return errorcode;
+
+    esp_now_register_send_cb(onSend);  
+    return ESP_OK;
+}
+
+//ジャイロを初期化する
 void initGyro() {
   M5.Lcd.fillScreen(BLACK);
   M5.Lcd.setTextColor(WHITE);
@@ -147,55 +176,10 @@ void initGyro() {
   init_gyroZ /= AVERAGENUM_GY;
 }
 
-void setup()
+
+//M5Stack GRAY内蔵センサーから測定値を取得する
+void scanM5gray_sensor()
 {
-  M5.begin();
-  /*
-    Power chip connected to gpio21, gpio22, I2C device
-    Set battery charging voltage and current
-    If used battery, please call this function in your project
-  */
-  M5.Power.begin();
-  M5.IMU.Init();
-  initGyro();
-  bmm150.Init();
-
-  bmm150.getMagnetOffset(&magoffsetX, &magoffsetY, &magoffsetZ);
-  bmm150.getMagnetScale(&magscaleX, &magscaleY, &magscaleZ);
-  
-  //USB Serial init
-  Serial.begin(115200);  // 一応Serialを初期化
-
-  //BLE Serial init
-//  char btname[8];
-//  sprintf(btname,"M5_%02d",DEVICENUM);
-//  SerialBT.begin(btname);
-
-  M5.Lcd.fillScreen(BLACK);
-  M5.Lcd.setTextColor(GREEN , BLACK);
-  M5.Lcd.setTextSize(2);
-
-  WiFi.begin(ssid,pass);
-  while(WiFi.status()!=WL_CONNECTED){
-    delay(500);
-    M5.Lcd.print(".");
-  }
-  M5.Lcd.println("WiFi connected");
-  M5.Lcd.print("IP address = ");
-  M5.Lcd.print(WiFi.localIP());
-  wifiUdp.begin(my_port);
-
-  delay(2000);
-  M5.Lcd.fillScreen(BLACK);
-
-  // multi-task
-  xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);
-}
-
-void loop()
-{
-  // put your main code here, to run repeatedly:
-  M5.update();
   M5.IMU.getGyroData(&gyroX, &gyroY, &gyroZ);
   gyroX -= init_gyroX;
   gyroY -= init_gyroY;
@@ -235,16 +219,7 @@ void loop()
   mq1 = *(getQ() + 1);
   mq2 = *(getQ() + 2);
   mq3 = *(getQ() + 3);
-/*  
-  yaw = atan2(2.0f * (*(getQ() + 1) * *(getQ() + 2) + *getQ() *
-                                                          *(getQ() + 3)),
-              *getQ() * *getQ() + *(getQ() + 1) * *(getQ() + 1) - *(getQ() + 2) * *(getQ() + 2) - *(getQ() + 3) * *(getQ() + 3));
-  pitch = -asin(2.0f * (*(getQ() + 1) * *(getQ() + 3) - *getQ() *
-                                                            *(getQ() + 2)));
-  roll = atan2(2.0f * (*getQ() * *(getQ() + 1) + *(getQ() + 2) *
-                                                     *(getQ() + 3)),
-               *getQ() * *getQ() - *(getQ() + 1) * *(getQ() + 1) - *(getQ() + 2) * *(getQ() + 2) + *(getQ() + 3) * *(getQ() + 3));
-*/
+
   yaw = atan2(2.0f * (mq1 * mq2 + mq0 * mq3), mq0* mq0 + mq1 * mq1 - mq2 * mq2 - mq3 * mq3);
   pitch = -asin(2.0f * (mq1 * mq3 - mq0 * mq2));
   roll = atan2(2.0f * (mq0 * mq1 + mq2 * mq3),mq0 * mq0 - mq1 * mq1 - mq2 * mq2 + mq3 * mq3);
@@ -256,33 +231,165 @@ void loop()
   pitch *= RAD_TO_DEG;
   yaw *= RAD_TO_DEG;
   roll *= RAD_TO_DEG;
+}
 
-  delay(1); 
-
-  if(M5.BtnA.wasPressed())
-  {
+//M5Stack GRAYの地磁気センサー(bmm150)のキャリブレーション
+void M5sensor_calibration()
+{
 //    vTaskSuspend(lcdTaskHandle);
-    vTaskDelete(lcdTaskHandle);
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(WHITE);
-    M5.Lcd.setTextSize(1);
-    M5.Lcd.setCursor(0, 0);
-    M5.Lcd.print("begin calibration in 3 seconds");
-    delay(3000);
-    M5.Lcd.setCursor(0, 10);
-    M5.Lcd.print("Flip + rotate core calibration");
-    bmm150.bmm150_calibrate(15000);
-    delay(100);
-
-    bmm150.Init();
-    bmm150.getMagnetOffset(&magoffsetX, &magoffsetY, &magoffsetZ);
-    bmm150.getMagnetScale(&magscaleX, &magscaleY, &magscaleZ);
-
-    M5.Lcd.fillScreen(BLACK);
-    M5.Lcd.setTextColor(GREEN, BLACK);
-    M5.Lcd.setTextSize(2);
+   vTaskDelete(lcdTaskHandle); //マルチタスクの削除
+   M5.Lcd.fillScreen(BLACK);
+   M5.Lcd.setTextColor(WHITE);
+   M5.Lcd.setTextSize(1);
+   M5.Lcd.setCursor(0, 0);
+   M5.Lcd.print("begin calibration in 3 seconds");
+   delay(3000);
+   M5.Lcd.setCursor(0, 10);
+   M5.Lcd.print("Flip + rotate core calibration");
+   bmm150.bmm150_calibrate(15000);  //キャリブレーションルーチンの呼び出し(bmm150class.cpp)
+   delay(100);
+   bmm150.Init();
+   bmm150.getMagnetOffset(&magoffsetX, &magoffsetY, &magoffsetZ);
+   bmm150.getMagnetScale(&magscaleX, &magscaleY, &magscaleZ);
+   M5.Lcd.fillScreen(BLACK);
+   M5.Lcd.setTextColor(GREEN, BLACK);
+   M5.Lcd.setTextSize(2);
 //    vTaskResume(lcdTaskHandle);
-  // multi-task
-  xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);
+}
+
+//センサー起動前にESP-NOW通信を開始するので、それ用のダミーデータの作成
+void set_dummydata(){
+  memset(txbuf,0,250);
+  sprintf((char*)txbuf,"{\"devnum\":%d,\"q\":[%5.2f,%5.2f,%5.2f,%5.2f]}",devvar,0.1,-0.2,0.3,-0.4);
+  txlen=strlen((char*)txbuf);
+}
+
+void setup()
+{
+  Preferences mypref;
+
+  M5.begin();
+  /*
+    Power chip connected to gpio21, gpio22, I2C device
+    Set battery charging voltage and current
+    If used battery, please call this function in your project
+  */
+  M5.Power.begin();
+  M5.IMU.Init();
+  initGyro();
+  bmm150.Init();
+
+  bmm150.getMagnetOffset(&magoffsetX, &magoffsetY, &magoffsetZ);
+  bmm150.getMagnetScale(&magscaleX, &magscaleY, &magscaleZ);
+  
+  //不揮発メモリから記録してあったデバイス番号を読みだす
+  mypref.begin("mymem",false);
+  mypref.getBytes("devno",&devvar,1);
+  if(devvar>19){//もしデバイス番号がありえない数字だったら初期化
+    mypref.clear();
+    mypref.putBytes("devno",0,1);
+    devvar = 0;
   }
+  mypref.end();
+
+  //USB Serial init
+  Serial.begin(115200);  // Serialを初期化
+
+  M5.Lcd.fillScreen(BLACK);
+  M5.Lcd.setTextColor(GREEN , BLACK);
+  M5.Lcd.setTextSize(2);
+
+  //ESP_NOW Setting
+  WiFi.mode(WIFI_STA);
+  WiFi.disconnect();
+  if (esp_now_init() == ESP_OK) {
+    M5.Lcd.setCursor(0,0);
+    M5.Lcd.print("ESP NOW INIT OK");
+    M5.Lcd.setCursor(0,16);
+    M5.Lcd.print("Waiting for master call");
+  }
+  esp_now_register_recv_cb(onReceive);
+
+  delay(2000);
+
+
+  // multi-task
+//  xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);
+}
+
+void loop()
+{
+  esp_err_t result;
+  Preferences mypref;
+
+  M5.update();
+  scanM5gray_sensor();
+
+  if(M5.BtnA.wasPressed()){  //キャリブレーションシーケンス
+    M5sensor_calibration();
+    mypref.begin("mymem",false);
+    mypref.putBytes("devno",&devvar,1);
+    mypref.end();
+    xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);//マルチタスク再開
+  }else if(M5.BtnC.wasPressed()){
+    if(devvar < 19)
+      devvar++;
+  }else if(M5.BtnB.wasPressed()){
+    if(devvar > 0)
+      devvar--;
+  }  else{
+    switch(state){
+      case 0: //マスターからのブロードキャスト通信を待つ
+        if(rcvmsg){
+          rcvmsg=false;
+          if(master_addr_get)
+            state=1;  //ブロードキャスト通信を受信したらstate=1に進む
+        }
+        break;
+      case 1:
+        if(set_master_as_peer()==ESP_OK) //マスターからのデータが問題なければ、通信元のMACアドレスをpeerに登録する
+          state = 2;  // 成功したらstate=2に進む
+        else
+          state = 0;  // 失敗したらstate=0に戻る
+        break;
+      case 2: //自分のアドレスをマスターに知らせるために、適当なタイミングでデータを送信する
+        set_dummydata();
+        delay(10 * devvar);  //衝突回避のインターバル
+        result = esp_now_send(master_addr,txbuf,txlen);
+        if(result == ESP_OK){
+          M5.Lcd.fillScreen(BLACK);
+          xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);// マルチタスクの開始
+          state = 3;
+        }else
+          state = 5;
+        break;
+      case 3: //定常状態
+        if(rcvmsg){ //自局あてのメッセージを受信したら即データを送信する
+          rcvmsg=false;
+          result = esp_now_send(master_addr,txbuf,txlen);
+          state = 4;
+        }
+        break;
+      case 4://次の送信開始までの最小インターバル時間空ける
+//        M5.Lcd.setCursor(0,48);
+//        M5.Lcd.printf("tx done:%d",txcnt++);
+        delay(10);
+        state = 3;
+        break;      
+      case 5: // first tx failed
+        M5.Lcd.setCursor(0,32);
+        M5.Lcd.printf("first tx fail:%d\n%02X:%02X:%02X:%02X:%02X:%02X",ESP_OK,
+          (unsigned char)master_addr[0],
+          (unsigned char)master_addr[1],
+          (unsigned char)master_addr[2],
+          (unsigned char)master_addr[3],
+          (unsigned char)master_addr[4],
+          (unsigned char)master_addr[5]);
+        for(;;);//halt
+        break;
+      default:
+        break;   
+    }
+  }
+  delay(1); 
 }
