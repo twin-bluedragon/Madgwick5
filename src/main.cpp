@@ -19,7 +19,9 @@ uint8_t devvar;
 
 //ESP_NOW
 bool rcvmsg = false;
+bool resetrequest = false;
 bool master_addr_get = false;
+bool restart = false;
 uint8_t master_addr[] = {0,0,0,0,0,0};
 uint8_t rxbuf[250];
 int rxlen=0;
@@ -131,10 +133,15 @@ void onReceive(const uint8_t* mac_addr, const uint8_t* data, int data_len) {
   rcvmsg = true;
   memcpy(rxbuf,data,data_len);//受信バッファにデータをコピーする
   rxlen = data_len;
-  if(*data==0){ //受信データの1バイト目が0だったらマスターアドレス取得フェーズとみなし、そのMACアドレスをmaster_addrとする
-    memcpy(master_addr,mac_addr,6);
+  if(state==0){
+    memcpy(master_addr,mac_addr,6);//statusが0だったら、そのMACアドレスをmaster_addrとする
     master_addr_get = true;
+    if(*data!=0) //データが0以外だったら不測のリセットかかったとみなす
+      restart=true;
+    else
+      restart=false;
   }
+
 }
 
 // ESP-NOWで受信した際に呼び出されるコールバック関数（何もしない）
@@ -330,6 +337,7 @@ void loop()
     mypref.begin("mymem",false);
     mypref.putBytes("devno",&devvar,1);
     mypref.end();
+    M5.Lcd.fillScreen(BLACK);
     xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);//マルチタスク再開
   }else if(M5.BtnC.wasPressed()){
     if(devvar < 19)
@@ -354,8 +362,12 @@ void loop()
         break;
       case 2: //自分のアドレスをマスターに知らせるために、適当なタイミングでデータを送信する
         set_dummydata();
-        delay(10 * devvar);  //衝突回避のインターバル
-        result = esp_now_send(master_addr,txbuf,txlen);
+        if(!restart){
+          delay(10 * devvar);  //衝突回避のインターバル
+          result = esp_now_send(master_addr,txbuf,txlen);          
+        }else
+          result = ESP_OK;  //restart==trueならチェックしないでESP_OKにする
+
         if(result == ESP_OK){
           M5.Lcd.fillScreen(BLACK);
           xTaskCreatePinnedToCore(lcdUpdateTask, "lcdTask", 4096, NULL, 1, &lcdTaskHandle, 1);// マルチタスクの開始
